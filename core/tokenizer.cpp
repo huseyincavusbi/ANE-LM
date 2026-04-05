@@ -31,15 +31,44 @@ bool Tokenizer::init(const std::string& model_dir) {
     }
 
     vocab_size_ = (int)tok_->GetVocabSize();
-    eos_id_ = tok_->TokenToId("<|endoftext|>");
+
+    // Load tokenizer_config.json for special token strings + chat template
+    std::string tc_path = model_dir + "/tokenizer_config.json";
+    std::ifstream tcf(tc_path);
+    if (tcf.is_open()) {
+        try {
+            auto j = nlohmann::json::parse(tcf);
+            if (j.contains("bos_token") && j["bos_token"].is_string())
+                bos_token_ = j["bos_token"].get<std::string>();
+            if (j.contains("eos_token") && j["eos_token"].is_string())
+                eos_token_ = j["eos_token"].get<std::string>();
+            if (j.contains("chat_template") && j["chat_template"].is_string()) {
+                chat_template_ = j["chat_template"].get<std::string>();
+                LOG("Chat template loaded from tokenizer_config.json\n");
+            }
+        } catch (...) {}
+    }
+
+    // Resolve EOS: prefer configured eos_token, then common fallbacks
+    auto try_token = [&](const std::string& s) -> int {
+        if (s.empty()) return -1;
+        return tok_->TokenToId(s);
+    };
+    eos_id_ = try_token(eos_token_);
+    if (eos_id_ < 0) eos_id_ = try_token("<|endoftext|>");
+    if (eos_id_ < 0) eos_id_ = try_token("<eos>");
+    if (eos_id_ < 0) eos_id_ = try_token("</s>");
+
+    // BOS fallback
+    if (bos_token_.empty()) bos_token_ = tok_->IdToToken(tok_->TokenToId("<|endoftext|>"));
+
+    // Qwen-style turn tokens
     im_start_id_ = tok_->TokenToId("<|im_start|>");
-    im_end_id_ = tok_->TokenToId("<|im_end|>");
+    im_end_id_   = tok_->TokenToId("<|im_end|>");
+    // Gemma-style turn token: <end_of_turn> also stops generation
+    if (im_end_id_ < 0) im_end_id_ = tok_->TokenToId("<end_of_turn>");
 
-    // Resolve special tokens for template context
-    bos_token_ = tok_->IdToToken(tok_->TokenToId("<|endoftext|>"));
-    eos_token_ = tok_->IdToToken(eos_id_);
-
-    // Load chat template: try chat_template.jinja first, then tokenizer_config.json
+    // Load chat template: chat_template.jinja overrides tokenizer_config.json
     std::string jinja_path = model_dir + "/chat_template.jinja";
     std::ifstream jf(jinja_path);
     if (jf.is_open()) {
@@ -47,20 +76,6 @@ bool Tokenizer::init(const std::string& model_dir) {
         jss << jf.rdbuf();
         chat_template_ = jss.str();
         LOG("Chat template loaded from chat_template.jinja\n");
-    } else {
-        std::string tc_path = model_dir + "/tokenizer_config.json";
-        std::ifstream tcf(tc_path);
-        if (tcf.is_open()) {
-            try {
-                auto j = nlohmann::json::parse(tcf);
-                if (j.contains("chat_template") && j["chat_template"].is_string()) {
-                    chat_template_ = j["chat_template"].get<std::string>();
-                    LOG("Chat template loaded from tokenizer_config.json\n");
-                }
-            } catch (...) {
-                // ignore parse errors
-            }
-        }
     }
 
     LOG("Tokenizer loaded: %d tokens (eos=%d, im_start=%d, im_end=%d)\n",
