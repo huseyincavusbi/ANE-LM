@@ -397,6 +397,58 @@ static id mil_gen_fused_ffn(int dim, int inter_ch) {
     return ns_data(buf, n);
 }
 
+static id mil_gen_fused_ffn_gelu(int dim, int inter_ch) {
+    // GeGLU: gelu(gate_proj(x)) * up_proj(x), then down_proj
+    // ANE doesn't support the MIL 'gelu' op, so approximate with sigmoid:
+    //   gelu(x) ≈ x * sigmoid(1.702 * x)   (Hendrycks sigmoid approx, <0.1% error)
+    // Same ops as the working SiLU path, just with a 1.702 pre-scale.
+    char buf[8192];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        "        tensor<fp16, []> c17 = const()[name = tensor<string, []>(\"c17\"), val = tensor<fp16, []>(1.7015625)];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wg = const()[name = tensor<string, []>(\"Wg\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wg.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wu = const()[name = tensor<string, []>(\"Wu\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wu.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wd = const()[name = tensor<string, []>(\"Wd\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wd.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> gate = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wg, x = x)[name = tensor<string, []>(\"cg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> up   = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wu, x = x)[name = tensor<string, []>(\"cu\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> sg   = mul(x = gate, y = c17)[name = tensor<string, []>(\"sg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> si   = sigmoid(x = sg)[name = tensor<string, []>(\"si\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> gg   = mul(x = gate, y = si)[name = tensor<string, []>(\"gg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> fused = mul(x = gg, y = up)[name = tensor<string, []>(\"fu\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> out  = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wd, x = fused)[name = tensor<string, []>(\"cd\")];\n"
+        "    } -> (out);\n"
+        "}\n",
+        // func input: [1, dim, 1, SP]
+        dim, SP,
+        // Wg [inter_ch, dim, 1, 1] x2, Wu [inter_ch, dim, 1, 1] x2, Wd [dim, inter_ch, 1, 1] x2
+        inter_ch, dim, inter_ch, dim,
+        inter_ch, dim, inter_ch, dim,
+        dim, inter_ch, dim, inter_ch,
+        // gate [1, inter_ch, 1, SP], up [1, inter_ch, 1, SP]
+        inter_ch, SP,
+        inter_ch, SP,
+        // sg, si, gg, fused [1, inter_ch, 1, SP]
+        inter_ch, SP,
+        inter_ch, SP,
+        inter_ch, SP,
+        inter_ch, SP,
+        // out [1, dim, 1, SP]
+        dim, SP);
+    return ns_data(buf, n);
+}
+
 // ============ Core compile/eval/free ============
 
 static ANEKernel* ane_compile_raw(id milText, id wdict,
@@ -827,6 +879,27 @@ ANEKernel* ane_compile_fused_3_blob(const std::string& a_path, int a_out,
     return r;
 }
 
+ANEKernel* ane_compile_fused_ffn_gelu(const uint16_t* gate_bf16, const uint16_t* up_bf16,
+                                       const uint16_t* down_bf16, int dim, int inter_ch) {
+    void* pool = objc_autoreleasePoolPush();
+    id wg = build_weight_blob(gate_bf16, inter_ch * dim);
+    id wu = build_weight_blob(up_bf16, inter_ch * dim);
+    id wd = build_weight_blob(down_bf16, dim * inter_ch);
+
+    id keys[]   = { ns_str("@model_path/weights/wg.bin"),
+                    ns_str("@model_path/weights/wu.bin"),
+                    ns_str("@model_path/weights/wd.bin") };
+    id values[] = { ns_weight_entry(wg), ns_weight_entry(wu), ns_weight_entry(wd) };
+    id wdict = ns_dict(keys, values, 3);
+
+    id mil = mil_gen_fused_ffn_gelu(dim, inter_ch);
+    size_t in_size = (size_t)dim * SP * sizeof(uint16_t);
+    size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
+    ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
 ANEKernel* ane_compile_fused_ffn_blob(const std::string& gate_path, const std::string& up_path,
                                        const std::string& down_path, int dim, int inter_ch) {
     void* pool = objc_autoreleasePoolPush();
@@ -842,6 +915,28 @@ ANEKernel* ane_compile_fused_ffn_blob(const std::string& gate_path, const std::s
     id wdict = ns_dict(keys, values, 3);
 
     id mil = mil_gen_fused_ffn(dim, inter_ch);
+    size_t in_size = (size_t)dim * SP * sizeof(uint16_t);
+    size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
+    ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+ANEKernel* ane_compile_fused_ffn_gelu_blob(const std::string& gate_path, const std::string& up_path,
+                                            const std::string& down_path, int dim, int inter_ch) {
+    void* pool = objc_autoreleasePoolPush();
+    id wg = load_blob_file(gate_path);
+    id wu = load_blob_file(up_path);
+    id wd = load_blob_file(down_path);
+    if (!wg || !wu || !wd) { objc_autoreleasePoolPop(pool); return nullptr; }
+
+    id keys[]   = { ns_str("@model_path/weights/wg.bin"),
+                    ns_str("@model_path/weights/wu.bin"),
+                    ns_str("@model_path/weights/wd.bin") };
+    id values[] = { ns_weight_entry(wg), ns_weight_entry(wu), ns_weight_entry(wd) };
+    id wdict = ns_dict(keys, values, 3);
+
+    id mil = mil_gen_fused_ffn_gelu(dim, inter_ch);
     size_t in_size = (size_t)dim * SP * sizeof(uint16_t);
     size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);

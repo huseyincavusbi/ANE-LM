@@ -37,6 +37,9 @@ ANEKernel* ane_compile_fused_3(const uint16_t* bf16_a, int a_out,
                                 int in_dim);
 ANEKernel* ane_compile_fused_ffn(const uint16_t* gate_bf16, const uint16_t* up_bf16,
                                   const uint16_t* down_bf16, int dim, int inter_ch);
+// GELU variant (GeGLU) for Gemma3 / models using gelu_pytorch_tanh activation
+ANEKernel* ane_compile_fused_ffn_gelu(const uint16_t* gate_bf16, const uint16_t* up_bf16,
+                                       const uint16_t* down_bf16, int dim, int inter_ch);
 
 // Kernel compilation (from pre-converted ANE blob files)
 ANEKernel* ane_compile_matmul_blob(const std::string& blob_path, int out_dim, int in_dim);
@@ -49,6 +52,8 @@ ANEKernel* ane_compile_fused_3_blob(const std::string& a_path, int a_out,
                                      int in_dim);
 ANEKernel* ane_compile_fused_ffn_blob(const std::string& gate_path, const std::string& up_path,
                                        const std::string& down_path, int dim, int inter_ch);
+ANEKernel* ane_compile_fused_ffn_gelu_blob(const std::string& gate_path, const std::string& up_path,
+                                            const std::string& down_path, int dim, int inter_ch);
 
 // Kernel execution
 bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int out_dim);
