@@ -10,6 +10,7 @@
 #include "utils.h"
 #include "generate.h"
 #include "core/model_loader.h"
+#include "server/http_server.h"
 
 // ObjC autorelease pool via C runtime API
 extern "C" void* objc_autoreleasePoolPush(void);
@@ -21,10 +22,12 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s generate --model <path> [--prompt <text>] [options]\n", prog);
     fprintf(stderr, "  %s chat --model <path> [options]\n", prog);
+    fprintf(stderr, "  %s serve --model <path> [--port N]\n", prog);
     fprintf(stderr, "  %s convert --model <path>\n", prog);
     fprintf(stderr, "\nSubcommands:\n");
     fprintf(stderr, "  generate    Single-shot text generation\n");
     fprintf(stderr, "  chat        Interactive multi-turn chat\n");
+    fprintf(stderr, "  serve       HTTP inference server (POST /generate, POST /chat)\n");
     fprintf(stderr, "  convert     Convert model weights from BF16 to FP16\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  --model <path>    Path to model directory (required)\n");
@@ -34,6 +37,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --repeat-penalty P Repetition penalty (default: 1.2, 1.0=off)\n");
     fprintf(stderr, "  --enable-thinking Enable thinking/reasoning mode\n");
     fprintf(stderr, "  --no-ane-cache    Disable persistent ANE compile cache\n");
+    fprintf(stderr, "  --port N          Server port (serve only, default: 8080)\n");
     fprintf(stderr, "  -v, --verbose     Show detailed initialization info\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s generate --model /path/to/Qwen3.5-0.8B --prompt \"Hello\" --max-tokens 50\n", prog);
@@ -48,6 +52,7 @@ struct Args {
     float repetition_penalty = 1.2f;
     bool ane_cache = true;
     bool enable_thinking = false;
+    int port = 8080;
 };
 
 static Args parse_args(int argc, char* argv[], int start) {
@@ -67,6 +72,8 @@ static Args parse_args(int argc, char* argv[], int start) {
             args.enable_thinking = true;
         } else if (strcmp(argv[i], "--no-ane-cache") == 0) {
             args.ane_cache = false;
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            args.port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             g_verbose = true;
         }
@@ -215,8 +222,9 @@ int main(int argc, char* argv[]) {
     bool is_generate = (strcmp(subcmd, "generate") == 0);
     bool is_chat = (strcmp(subcmd, "chat") == 0);
     bool is_convert = (strcmp(subcmd, "convert") == 0);
+    bool is_serve = (strcmp(subcmd, "serve") == 0);
 
-    if (!is_generate && !is_chat && !is_convert) {
+    if (!is_generate && !is_chat && !is_convert && !is_serve) {
         fprintf(stderr, "Unknown subcommand: %s\n\n", subcmd);
         print_usage(argv[0]);
         objc_autoreleasePoolPop(pool);
@@ -242,7 +250,7 @@ int main(int argc, char* argv[]) {
 
     LOG("=== ane-lm: Apple Neural Engine LLM Inference ===\n");
     LOG("Model: %s\n", args.model_dir);
-    LOG("Mode: %s\n", is_chat ? "chat" : "generate");
+    LOG("Mode: %s\n", is_serve ? "serve" : is_chat ? "chat" : "generate");
     LOG("Temperature: %.2f, Max tokens: %d\n", args.temperature, args.max_tokens);
     LOG("ANE compile cache: %s\n", args.ane_cache ? "enabled" : "disabled");
 
@@ -260,7 +268,11 @@ int main(int argc, char* argv[]) {
     }
 
     int ret;
-    if (is_chat) {
+    if (is_serve) {
+        HttpServer server(*model, tokenizer, args.port);
+        server.run();
+        ret = 0;
+    } else if (is_chat) {
         ret = cmd_chat(*model, tokenizer, args);
     } else {
         ret = cmd_generate(*model, tokenizer, args);
