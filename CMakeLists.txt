@@ -56,22 +56,23 @@ set(CORE_SOURCES
 set(MODEL_SOURCES
     models/llm/qwen3_5.cpp
     models/llm/qwen3.cpp
+    models/llm/gemma3.cpp
+)
+
+set(SERVER_SOURCES
+    server/http_server.cpp
 )
 
 set(MAIN_SOURCE
     main.cpp
 )
 
-# Executable
-add_executable(ane-lm
-    ${VENDOR_SOURCES}
-    ${CORE_SOURCES}
-    ${MODEL_SOURCES}
-    ${MAIN_SOURCE}
+set(CLIB_SOURCE
+    lib/ane_lm_c.cpp
 )
 
-# Link frameworks and ObjC runtime
-target_link_libraries(ane-lm PRIVATE
+# Common compile options
+set(COMMON_LINK_LIBS
     nlohmann_json::nlohmann_json
     tokenizers_cpp
     "-framework Foundation"
@@ -80,10 +81,42 @@ target_link_libraries(ane-lm PRIVATE
     "-lobjc"
 )
 
-# Optimization for release
-target_compile_options(ane-lm PRIVATE
+set(COMMON_COMPILE_OPTS
     $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:RelWithDebInfo>:-O2 -g>
+)
+
+# ============ Main CLI executable ============
+add_executable(ane-lm
+    ${VENDOR_SOURCES}
+    ${CORE_SOURCES}
+    ${MODEL_SOURCES}
+    ${SERVER_SOURCES}
+    ${MAIN_SOURCE}
+)
+target_link_libraries(ane-lm PRIVATE ${COMMON_LINK_LIBS})
+target_compile_options(ane-lm PRIVATE ${COMMON_COMPILE_OPTS})
+
+# ============ Shared library (C public API) ============
+add_library(ane-lm-lib SHARED
+    ${VENDOR_SOURCES}
+    ${CORE_SOURCES}
+    ${MODEL_SOURCES}
+    ${CLIB_SOURCE}
+)
+target_link_libraries(ane-lm-lib PRIVATE ${COMMON_LINK_LIBS})
+target_compile_options(ane-lm-lib PRIVATE ${COMMON_COMPILE_OPTS})
+set_target_properties(ane-lm-lib PROPERTIES
+    OUTPUT_NAME "ane_lm"
+    PUBLIC_HEADER "include/ane_lm/ane_lm.h;include/ane_lm/common.h"
+    MACOSX_RPATH ON
+)
+
+# Install targets
+install(TARGETS ane-lm ane-lm-lib
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    PUBLIC_HEADER DESTINATION include/ane_lm
 )
 
 # Default to Release if not specified
