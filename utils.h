@@ -2,6 +2,7 @@
 
 #include "models/llm/qwen3_5.h"
 #include "models/llm/qwen3.h"
+#include "models/llm/gemma3.h"
 #include "core/tokenizer.h"
 #include <memory>
 #include <string>
