@@ -29,6 +29,15 @@ void rmsnorm(float* out, const float* x, const float* weight, int dim, float eps
     vDSP_vmul(out, 1, weight, 1, out, 1, (vDSP_Length)dim);
 }
 
+void rmsnorm_gemma(float* out, const float* x, const float* weight, int dim, float eps) {
+    float ss = 0.0f;
+    vDSP_svesq(x, 1, &ss, (vDSP_Length)dim);
+    ss = 1.0f / sqrtf(ss / dim + eps);
+    vDSP_vsmul(x, 1, &ss, out, 1, (vDSP_Length)dim);
+    // out[i] *= (1 + weight[i])
+    for (int i = 0; i < dim; i++) out[i] *= (1.0f + weight[i]);
+}
+
 void rmsnorm_gated(float* out, const float* x, const float* z,
                    const float* weight, int dim) {
     rmsnorm(out, x, weight, dim);

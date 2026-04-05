@@ -19,6 +19,8 @@ void mul_sigmoid_inplace(float* y, const float* z, int n, float* tmp);
 // ============ RMSNorm ============
 
 void rmsnorm(float* out, const float* x, const float* weight, int dim, float eps = 1e-6f);
+// Gemma variant: multiplies by (1 + weight) instead of weight
+void rmsnorm_gemma(float* out, const float* x, const float* weight, int dim, float eps = 1e-6f);
 void rmsnorm_gated(float* out, const float* x, const float* z, const float* weight, int dim);
 
 // ============ RoPE ============
