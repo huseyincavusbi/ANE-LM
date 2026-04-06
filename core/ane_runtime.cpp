@@ -12,6 +12,7 @@
 #include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sched.h>
 #include <ftw.h>
 #include "ane_runtime.h"
 #include <ane_lm/common.h>
@@ -525,39 +526,18 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
         }
     }
 
-    // Cache check / compile / load
+    // Compile (if not already cached), then load once.
+    // Each kernel is kept loaded for the model's lifetime; ane_free() unloads it.
+    // Total loaded kernels must stay ≤ ANE per-process limit (~51).
     id e = nullptr;
-    bool loaded_from_cache = false;
     if (g_ane_persist_cache && file_exists(compiledMarker)) {
-        e = nullptr;
-        bool ok = ((bool(*)(id,SEL,unsigned int,id,id*))objc_msgSend)(
-            mdl, sel("loadWithQoS:options:error:"), 21, ns_empty_dict(), &e);
-        if (ok) {
-            loaded_from_cache = true;
-            g_ane_cache_load_count++;
-        } else {
-            remove(compiledMarker.c_str());
-            e = nullptr;
-        }
-    }
-
-    if (!loaded_from_cache) {
+        g_ane_cache_load_count++;
+    } else {
         e = nullptr;
         if (!((bool(*)(id,SEL,unsigned int,id,id*))objc_msgSend)(
                 mdl, sel("compileWithQoS:options:error:"), 21, ns_empty_dict(), &e)) {
             fprintf(stderr, "ANE compile failed: %s\n",
                 e ? to_cstr(((id(*)(id,SEL))objc_msgSend)(e, sel("description"))) : "unknown");
-            remove(compiledMarker.c_str());
-            ane_remove_compile_dir(td, true);
-            objc_autoreleasePoolPop(local_pool);
-            return nullptr;
-        }
-        e = nullptr;
-        if (!((bool(*)(id,SEL,unsigned int,id,id*))objc_msgSend)(
-                mdl, sel("loadWithQoS:options:error:"), 21, ns_empty_dict(), &e)) {
-            fprintf(stderr, "ANE load failed: %s\n",
-                e ? to_cstr(((id(*)(id,SEL))objc_msgSend)(e, sel("description"))) : "unknown");
-            remove(compiledMarker.c_str());
             ane_remove_compile_dir(td, true);
             objc_autoreleasePoolPop(local_pool);
             return nullptr;
@@ -565,9 +545,17 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
         g_compile_count++;
         if (g_ane_persist_cache) {
             write_file(compiledMarker, "ok", 2);
-        } else {
-            remove(compiledMarker.c_str());
         }
+    }
+
+    // Load the compiled program into ANE hardware (kept resident until ane_free)
+    e = nullptr;
+    if (!((bool(*)(id,SEL,unsigned int,id,id*))objc_msgSend)(
+            mdl, sel("loadWithQoS:options:error:"), 21, ns_empty_dict(), &e)) {
+        fprintf(stderr, "ANE load failed: %s\n",
+            e ? to_cstr(((id(*)(id,SEL))objc_msgSend)(e, sel("description"))) : "unknown");
+        objc_autoreleasePoolPop(local_pool);
+        return nullptr;
     }
 
     // Create kernel struct
@@ -630,6 +618,7 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
 }
 
 static bool ane_eval_raw(ANEKernel* k) {
+    // Kernel is already loaded (done once in ane_compile_raw). Just evaluate.
     id e = nullptr;
     bool ok = ((bool(*)(id,SEL,unsigned int,id,id,id*))objc_msgSend)(
         k->model, sel("evaluateWithQoS:options:request:error:"),
