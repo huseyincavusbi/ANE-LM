@@ -37,6 +37,8 @@ void softmax(float* x, int n);
 // ============ Matrix-Vector Multiply ============
 
 void matvec(float* y, const float* W, const float* x, int out_dim, int in_dim);
+// CPU matmul with BF16 weights (converts row-by-row using Accelerate sdot)
+void matvec_bf16(float* y, const uint16_t* W, const float* x, int out_dim, int in_dim);
 
 // ============ L2 Normalization ============
 

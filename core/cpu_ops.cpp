@@ -1,4 +1,6 @@
 #include "cpu_ops.h"
+#include <ane_lm/common.h>
+#include <vector>
 #include <alloca.h>
 
 namespace ane_lm {
@@ -86,6 +88,15 @@ void softmax(float* x, int n) {
 void matvec(float* y, const float* W, const float* x, int out_dim, int in_dim) {
     cblas_sgemv(CblasRowMajor, CblasNoTrans, out_dim, in_dim, 1.0f,
                 W, in_dim, x, 1, 0.0f, y, 1);
+}
+
+void matvec_bf16(float* y, const uint16_t* W, const float* x, int out_dim, int in_dim) {
+    thread_local std::vector<float> row_buf;
+    row_buf.resize(in_dim);
+    for (int i = 0; i < out_dim; i++) {
+        bf16_to_f32_vec(row_buf.data(), W + (size_t)i * in_dim, in_dim);
+        y[i] = cblas_sdot(in_dim, row_buf.data(), 1, x, 1);
+    }
 }
 
 void l2_normalize(float* x, int dim) {
