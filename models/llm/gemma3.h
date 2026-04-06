@@ -4,6 +4,7 @@
 #include "../../core/ane_runtime.h"
 #include "../../core/model_loader.h"
 #include <nlohmann/json.hpp>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,7 +60,6 @@ private:
     int rope_cache_len_ = 0;
 
     static constexpr int KV_CACHE_CAPACITY = 2048;
-    static constexpr int LM_HEAD_ANE_CHUNK_MAX = 16384;
 
     // per-layer: is this layer global attention (vs sliding window)?
     std::vector<bool> is_global_attn_;
@@ -72,6 +72,14 @@ private:
         // Per-head Q/K norms (Gemma3 specific, shape=[head_dim])
         float* q_norm = nullptr;
         float* k_norm = nullptr;
+        // BF16 projection weights for CPU fallback (point into mmap'd safetensors)
+        const uint16_t* q_proj_w = nullptr;
+        const uint16_t* k_proj_w = nullptr;
+        const uint16_t* v_proj_w = nullptr;
+        const uint16_t* o_proj_w = nullptr;
+        const uint16_t* gate_proj_w = nullptr;
+        const uint16_t* up_proj_w = nullptr;
+        const uint16_t* down_proj_w = nullptr;
     };
 
     struct KVCache {
@@ -85,17 +93,15 @@ private:
     std::vector<LayerWeights> layers_;
     std::vector<KVCache> kv_caches_;
     std::vector<LayerANEKernels> ane_layers_;
-    // When ffn_is_fused_=false: ane_layers_[L].fused_ffn = gate+up kernel,
-    // ffn_down_[L] = down proj kernel.
-    std::vector<ANEKernel*> ffn_down_;
 
     float* embed_tokens_ = nullptr;
     float* lm_head_ = nullptr;
     float* final_norm_ = nullptr;
 
-    std::vector<ANEKernel*> lm_head_kernels_;
-    int lm_head_chunk_ = LM_HEAD_ANE_CHUNK_MAX;
-    bool ane_lm_head_enabled_ = false;
+    // Keep safetensors mmap alive so BF16 CPU weight pointers remain valid
+    std::unique_ptr<ModelWeights> weights_;
+    // True when num_layers * 2 <= ANE_LOAD_LIMIT so first_proj can run on ANE
+    bool use_ane_first_proj_ = false;
 
     float* x_ = nullptr;
     float* x_norm_ = nullptr;
@@ -113,8 +119,6 @@ private:
     void apply_args(const Gemma3Args& a);
     bool load_weights(ModelWeights* sf);
     bool compile_ane(ModelWeights* sf, const std::string& blob_dir);
-    bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);
-    void free_lm_head_ane();
     void build_rope_table(float* cos_out, float* sin_out, int len, float theta) const;
 };
 

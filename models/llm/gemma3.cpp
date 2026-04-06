@@ -106,11 +106,6 @@ Gemma3Model::~Gemma3Model() {
         free(kv.v_cache);
     }
     for (auto& lk : ane_layers_) ane_free_layer(&lk);
-
-    for (auto* k : ffn_down_) ane_free(k);
-    ffn_down_.clear();
-
-    free_lm_head_ane();
 }
 
 void Gemma3Model::reset() {
@@ -208,6 +203,22 @@ bool Gemma3Model::load_weights(ModelWeights* sf) {
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", L);
         lw.k_norm = sf->load_bf16_to_f32(name, head_dim_);
         if (!lw.k_norm) return false;
+
+        // BF16 pointers for CPU fallback (backed by mmap kept alive in weights_)
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", L);
+        lw.q_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", L);
+        lw.k_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", L);
+        lw.v_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
+        lw.o_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", L);
+        lw.gate_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", L);
+        lw.up_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", L);
+        lw.down_proj_w = sf->get_bf16_ptr(name);
     }
 
     LOG("All Gemma3 weights loaded successfully\n");
@@ -230,10 +241,19 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         return false;
     }
 
-    bool use_blobs = !blob_dir.empty();
-    LOG("Compiling Gemma3 ANE kernels%s...\n", use_blobs ? " (from blobs)" : "");
+    // Budget: each loadWithQoS call counts against a per-process limit (~51).
+    // o_proj and lm_head are always on CPU. first_proj is on ANE only if
+    // 2 kernels/layer fits (first_proj + fused_ffn).
+    static constexpr int ANE_LOAD_LIMIT = 51;
+    use_ane_first_proj_ = (num_layers_ * 2 <= ANE_LOAD_LIMIT);
 
-    // Try fused GELU FFN kernel on the first layer to detect support
+    bool use_blobs = !blob_dir.empty();
+    LOG("Compiling Gemma3 ANE kernels%s (first_proj=%s, o_proj=CPU, lm_head=CPU)...\n",
+        use_blobs ? " (from blobs)" : "",
+        use_ane_first_proj_ ? "ANE" : "CPU");
+
+    // Test fused GELU FFN on layer 0 to detect hardware support.
+    // If it fails, fall back to CPU for FFN entirely (to stay within ANE budget).
     ffn_is_fused_ = true;
     {
         const char* g0 = "model.layers.0.mlp.gate_proj.weight";
@@ -247,7 +267,7 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
                 sf->get_bf16_ptr(g0), sf->get_bf16_ptr(u0),
                 sf->get_bf16_ptr(d0), hidden_size_, intermediate_size_);
         if (!test) {
-            LOG("  GELU fused FFN not supported, falling back to split gate+up/down\n");
+            LOG("  GELU fused FFN not supported, falling back to CPU for FFN\n");
             ffn_is_fused_ = false;
         } else {
             ane_free(test);
@@ -255,8 +275,8 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     }
 
     if (!ffn_is_fused_) {
-        scratch_ffn_ = (float*)calloc((size_t)2 * intermediate_size_, sizeof(float));
-        ffn_down_.resize(num_layers_, nullptr);
+        // CPU FFN needs scratch buffer for intermediate gate+up result
+        scratch_ffn_ = (float*)calloc((size_t)intermediate_size_, sizeof(float));
     }
 
     char name[256], name2[256], name3[256];
@@ -264,49 +284,37 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     for (int L = 0; L < num_layers_; L++) {
         LOG("  Layer %d/%d...\r", L + 1, num_layers_);
 
-        // QKV projection (fused)
-        snprintf(name,  sizeof(name),  "model.layers.%d.self_attn.q_proj.weight", L);
-        snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
-        snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
+        if (use_ane_first_proj_) {
+            // QKV projection (fused)
+            snprintf(name,  sizeof(name),  "model.layers.%d.self_attn.q_proj.weight", L);
+            snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
+            snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
 
-        if (use_blobs) {
-            ane_layers_[L].first_proj = ane_compile_fused_3_blob(
-                blob_path(blob_dir, name),  q_proj_dim_,
-                blob_path(blob_dir, name2), kv_proj_dim_,
-                blob_path(blob_dir, name3), kv_proj_dim_,
-                hidden_size_);
-        } else {
-            ane_layers_[L].first_proj = ane_compile_fused_3(
-                sf->get_bf16_ptr(name),  q_proj_dim_,
-                sf->get_bf16_ptr(name2), kv_proj_dim_,
-                sf->get_bf16_ptr(name3), kv_proj_dim_,
-                hidden_size_);
+            if (use_blobs) {
+                ane_layers_[L].first_proj = ane_compile_fused_3_blob(
+                    blob_path(blob_dir, name),  q_proj_dim_,
+                    blob_path(blob_dir, name2), kv_proj_dim_,
+                    blob_path(blob_dir, name3), kv_proj_dim_,
+                    hidden_size_);
+            } else {
+                ane_layers_[L].first_proj = ane_compile_fused_3(
+                    sf->get_bf16_ptr(name),  q_proj_dim_,
+                    sf->get_bf16_ptr(name2), kv_proj_dim_,
+                    sf->get_bf16_ptr(name3), kv_proj_dim_,
+                    hidden_size_);
+            }
+            if (!ane_layers_[L].first_proj) {
+                fprintf(stderr, "ANE first_proj failed at layer %d\n", L);
+                return false;
+            }
         }
-        if (!ane_layers_[L].first_proj) {
-            fprintf(stderr, "ANE first_proj failed at layer %d\n", L);
-            return false;
-        }
-
-        // Output projection
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
-        if (use_blobs) {
-            ane_layers_[L].o_proj = ane_compile_matmul_blob(
-                blob_path(blob_dir, name), hidden_size_, q_proj_dim_);
-        } else {
-            ane_layers_[L].o_proj = ane_compile_matmul(
-                sf->get_bf16_ptr(name), hidden_size_, q_proj_dim_);
-        }
-        if (!ane_layers_[L].o_proj) {
-            fprintf(stderr, "ANE o_proj failed at layer %d\n", L);
-            return false;
-        }
-
-        // FFN
-        snprintf(name,  sizeof(name),  "model.layers.%d.mlp.gate_proj.weight", L);
-        snprintf(name2, sizeof(name2), "model.layers.%d.mlp.up_proj.weight",   L);
-        snprintf(name3, sizeof(name3), "model.layers.%d.mlp.down_proj.weight", L);
+        // o_proj is always on CPU — do not compile
 
         if (ffn_is_fused_) {
+            snprintf(name,  sizeof(name),  "model.layers.%d.mlp.gate_proj.weight", L);
+            snprintf(name2, sizeof(name2), "model.layers.%d.mlp.up_proj.weight",   L);
+            snprintf(name3, sizeof(name3), "model.layers.%d.mlp.down_proj.weight", L);
+
             if (use_blobs) {
                 ane_layers_[L].fused_ffn = ane_compile_fused_ffn_gelu_blob(
                     blob_path(blob_dir, name),
@@ -324,28 +332,8 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
                 fprintf(stderr, "ANE fused_ffn_gelu failed at layer %d\n", L);
                 return false;
             }
-        } else {
-            // Split: gate+up fused, down separate
-            if (use_blobs) {
-                ane_layers_[L].fused_ffn = ane_compile_fused_2_blob(
-                    blob_path(blob_dir, name),  intermediate_size_,
-                    blob_path(blob_dir, name2), intermediate_size_,
-                    hidden_size_);
-                ffn_down_[L] = ane_compile_matmul_blob(
-                    blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
-            } else {
-                ane_layers_[L].fused_ffn = ane_compile_fused_2(
-                    sf->get_bf16_ptr(name),  intermediate_size_,
-                    sf->get_bf16_ptr(name2), intermediate_size_,
-                    hidden_size_);
-                ffn_down_[L] = ane_compile_matmul(
-                    sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
-            }
-            if (!ane_layers_[L].fused_ffn || !ffn_down_[L]) {
-                fprintf(stderr, "ANE split FFN failed at layer %d\n", L);
-                return false;
-            }
         }
+        // When !ffn_is_fused_: FFN is CPU-only via BF16 pointers in LayerWeights
     }
 
     int compiled = ane_compile_count();
@@ -353,48 +341,9 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
         compiled + cached, compiled, cached);
 
-    if (!compile_lm_head_ane(sf, blob_dir))
-        LOG("ANE LM head disabled, falling back to CPU\n");
-    else
-        LOG("  LM head ANE enabled (%d chunks)\n", (int)lm_head_kernels_.size());
+    // LM head: always CPU (lm_head_ is float32, use matvec directly)
 
     return true;
-}
-
-bool Gemma3Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir) {
-    bool use_blobs = !blob_dir.empty();
-    const char* lm_name = tie_word_embeddings_ ? "model.embed_tokens.weight" : "lm_head.weight";
-
-    const uint16_t* lm_bf16 = sf->get_bf16_ptr(lm_name);
-    if (!lm_bf16) return false;
-
-    int chunk = lm_head_chunk_;
-    if (chunk > vocab_size_) chunk = vocab_size_;
-    int chunks = (vocab_size_ + chunk - 1) / chunk;
-    lm_head_kernels_.resize(chunks, nullptr);
-
-    LOG("  LM head ANE: %d chunks (chunk=%d)\n", chunks, chunk);
-    for (int c = 0; c < chunks; c++) {
-        int offset = c * chunk;
-        int rows = std::min(chunk, vocab_size_ - offset);
-        (void)use_blobs;
-        const uint16_t* chunk_w = lm_bf16 + (int64_t)offset * hidden_size_;
-        lm_head_kernels_[c] = ane_compile_matmul(chunk_w, rows, hidden_size_);
-        if (!lm_head_kernels_[c]) {
-            free_lm_head_ane();
-            return false;
-        }
-    }
-
-    ane_lm_head_enabled_ = true;
-    lm_head_chunk_ = chunk;
-    return true;
-}
-
-void Gemma3Model::free_lm_head_ane() {
-    for (auto* k : lm_head_kernels_) ane_free(k);
-    lm_head_kernels_.clear();
-    ane_lm_head_enabled_ = false;
 }
 
 // ============ Model loading ============
@@ -496,6 +445,9 @@ bool Gemma3Model::load(const std::string& model_dir) {
 
     if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) return false;
 
+    // Keep safetensors mmap alive — BF16 pointers in LayerWeights point into it
+    weights_ = std::move(sf);
+
     return true;
 }
 
@@ -518,14 +470,21 @@ float* Gemma3Model::forward(int token_id, int pos) {
 
         // QKV projection
         float* qkv_buf = scratch_qkv_;
-        if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x_norm_,
-                        hidden_size_, q_proj_dim_ + 2 * kv_proj_dim_)) {
-            fprintf(stderr, "ANE first_proj failed at layer %d\n", L);
-            return nullptr;
-        }
         float* q_raw = qkv_buf;
         float* k_raw = qkv_buf + q_proj_dim_;
         float* v_raw = qkv_buf + q_proj_dim_ + kv_proj_dim_;
+
+        if (use_ane_first_proj_) {
+            if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x_norm_,
+                            hidden_size_, q_proj_dim_ + 2 * kv_proj_dim_)) {
+                fprintf(stderr, "ANE first_proj failed at layer %d\n", L);
+                return nullptr;
+            }
+        } else {
+            matvec_bf16(q_raw, lw.q_proj_w, x_norm_, q_proj_dim_, hidden_size_);
+            matvec_bf16(k_raw, lw.k_proj_w, x_norm_, kv_proj_dim_, hidden_size_);
+            matvec_bf16(v_raw, lw.v_proj_w, x_norm_, kv_proj_dim_, hidden_size_);
+        }
 
         // Per-head Q/K norms (Gemma3: same weight shared across heads)
         for (int h = 0; h < num_q_heads_; h++)
@@ -589,12 +548,9 @@ float* Gemma3Model::forward(int token_id, int pos) {
                       num_q_heads_, num_kv_heads_, head_dim_, head_dim_,
                       eff_start, eff_len, cache.capacity);
 
-        // Output projection
+        // Output projection (always CPU)
         float* attn_out = x_norm_;
-        if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, q_proj_dim_, hidden_size_)) {
-            fprintf(stderr, "ANE o_proj failed at layer %d\n", L);
-            return nullptr;
-        }
+        matvec_bf16(attn_out, lw.o_proj_w, pre_oproj, hidden_size_, q_proj_dim_);
 
         // Post-attention norm + residual
         rmsnorm_gemma(attn_out, attn_out, lw.post_attention_layernorm, hidden_size_, rms_eps_);
@@ -612,30 +568,22 @@ float* Gemma3Model::forward(int token_id, int pos) {
                 return nullptr;
             }
         } else {
-            // Split: gate+up → CPU GELU → down
-            float* gate_up = scratch_ffn_;
-            if (!ane_matvec(ane_layers_[L].fused_ffn, gate_up, x_norm_,
-                            hidden_size_, 2 * intermediate_size_)) {
-                fprintf(stderr, "ANE gate+up failed at layer %d\n", L);
-                return nullptr;
-            }
-            float* gate_out = gate_up;
-            float* up_out   = gate_up + intermediate_size_;
+            // CPU GELU FFN: gate → GELU * up → down (scratch_ffn_ holds intermediate gate result)
+            float* gate_out = scratch_ffn_;
+            matvec_bf16(gate_out, lw.gate_proj_w, x_norm_, intermediate_size_, hidden_size_);
+            // Reuse ffn_out as up_out scratch temporarily
+            float* up_out = ffn_out;
+            matvec_bf16(up_out, lw.up_proj_w, x_norm_, intermediate_size_, hidden_size_);
 
             // GELU(gate) * up (in-place on gate_out)
             for (int i = 0; i < intermediate_size_; i++) {
-                // GELU tanh approximation
                 float g = gate_out[i];
                 float g3 = g * g * g;
                 float inner = 0.7978845608f * (g + 0.044715f * g3);
-                float tanh_val = tanhf(inner);
-                gate_out[i] = 0.5f * g * (1.0f + tanh_val) * up_out[i];
+                gate_out[i] = 0.5f * g * (1.0f + tanhf(inner)) * up_out[i];
             }
 
-            if (!ane_matvec(ffn_down_[L], ffn_out, gate_out, intermediate_size_, hidden_size_)) {
-                fprintf(stderr, "ANE ffn_down failed at layer %d\n", L);
-                return nullptr;
-            }
+            matvec_bf16(ffn_out, lw.down_proj_w, gate_out, hidden_size_, intermediate_size_);
         }
 
         // Post-FFN norm + residual
@@ -646,24 +594,8 @@ float* Gemma3Model::forward(int token_id, int pos) {
     // Final norm (Gemma variant: multiply by 1 + weight)
     rmsnorm_gemma(x_, x_, final_norm_, hidden_size_, rms_eps_);
 
-    // LM head
-    if (ane_lm_head_enabled_ && !lm_head_kernels_.empty()) {
-        bool ok = true;
-        int chunks = (int)lm_head_kernels_.size();
-        for (int c = 0; c < chunks && ok; c++) {
-            int offset = c * lm_head_chunk_;
-            int rows = std::min(lm_head_chunk_, vocab_size_ - offset);
-            if (!ane_matvec(lm_head_kernels_[c], logits_ + offset, x_, hidden_size_, rows)) {
-                ok = false;
-            }
-        }
-        if (!ok) {
-            free_lm_head_ane();
-            matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
-        }
-    } else {
-        matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
-    }
+    // LM head (always CPU — lm_head_ is float32)
+    matvec(logits_, lm_head_, x_, vocab_size_, hidden_size_);
 
     return logits_;
 }
