@@ -237,6 +237,9 @@ bool Qwen3Model::load(const std::string& model_dir) {
         return false;
     }
 
+    // Keep safetensors mmap alive — BF16 pointers in LayerWeights point into it
+    weights_ = std::move(sf);
+
     return true;
 }
 
@@ -275,6 +278,16 @@ bool Qwen3Model::load_weights(ModelWeights* sf) {
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", L);
         lw.k_norm = sf->load_bf16_to_f32(name, head_dim_);
         if (!lw.k_norm) return false;
+
+        // BF16 pointers for CPU fallback (backed by mmap kept alive in weights_)
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", L);
+        lw.q_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", L);
+        lw.k_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", L);
+        lw.v_proj_w = sf->get_bf16_ptr(name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
+        lw.o_proj_w = sf->get_bf16_ptr(name);
     }
 
     LOG("All Qwen3 weights loaded successfully\n");
@@ -297,47 +310,45 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         return false;
     }
 
+    // Budget: each loadWithQoS call counts against a per-process limit (~51).
+    // o_proj is always on CPU. first_proj is on ANE only if 2 kernels/layer fits.
+    static constexpr int ANE_LOAD_LIMIT = 51;
+    use_ane_first_proj_ = (num_layers_ * 2 <= ANE_LOAD_LIMIT);
+
     bool use_blobs = !blob_dir.empty();
-    LOG("Compiling Qwen3 ANE kernels%s...\n", use_blobs ? " (from blobs)" : "");
+    LOG("Compiling Qwen3 ANE kernels%s (first_proj=%s, o_proj=CPU, lm_head=CPU)...\n",
+        use_blobs ? " (from blobs)" : "",
+        use_ane_first_proj_ ? "ANE" : "CPU");
 
     char name[256], name2[256], name3[256];
 
     for (int L = 0; L < num_layers_; L++) {
         LOG("  Layer %d/%d...\r", L + 1, num_layers_);
 
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", L);
-        snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
-        snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
+        if (use_ane_first_proj_) {
+            snprintf(name,  sizeof(name),  "model.layers.%d.self_attn.q_proj.weight", L);
+            snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
+            snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
 
-        if (use_blobs) {
-            ane_layers_[L].first_proj = ane_compile_fused_3_blob(
-                blob_path(blob_dir, name), q_proj_dim_,
-                blob_path(blob_dir, name2), kv_proj_dim_,
-                blob_path(blob_dir, name3), kv_proj_dim_, hidden_size_);
-        } else {
-            ane_layers_[L].first_proj = ane_compile_fused_3(
-                sf->get_bf16_ptr(name), q_proj_dim_,
-                sf->get_bf16_ptr(name2), kv_proj_dim_,
-                sf->get_bf16_ptr(name3), kv_proj_dim_, hidden_size_);
+            if (use_blobs) {
+                ane_layers_[L].first_proj = ane_compile_fused_3_blob(
+                    blob_path(blob_dir, name), q_proj_dim_,
+                    blob_path(blob_dir, name2), kv_proj_dim_,
+                    blob_path(blob_dir, name3), kv_proj_dim_, hidden_size_);
+            } else {
+                ane_layers_[L].first_proj = ane_compile_fused_3(
+                    sf->get_bf16_ptr(name), q_proj_dim_,
+                    sf->get_bf16_ptr(name2), kv_proj_dim_,
+                    sf->get_bf16_ptr(name3), kv_proj_dim_, hidden_size_);
+            }
+            if (!ane_layers_[L].first_proj) {
+                fprintf(stderr, "ANE first_proj compile failed for layer %d\n", L);
+                return false;
+            }
         }
+        // o_proj is always on CPU — do not compile
 
-        if (!ane_layers_[L].first_proj) {
-            fprintf(stderr, "ANE first_proj compile failed for layer %d\n", L);
-            return false;
-        }
-
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
-        if (use_blobs) {
-            ane_layers_[L].o_proj = ane_compile_matmul_blob(blob_path(blob_dir, name), hidden_size_, full_out_dim_);
-        } else {
-            ane_layers_[L].o_proj = ane_compile_matmul(sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
-        }
-        if (!ane_layers_[L].o_proj) {
-            fprintf(stderr, "ANE o_proj compile failed for layer %d\n", L);
-            return false;
-        }
-
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", L);
+        snprintf(name,  sizeof(name),  "model.layers.%d.mlp.gate_proj.weight", L);
         snprintf(name2, sizeof(name2), "model.layers.%d.mlp.up_proj.weight", L);
         snprintf(name3, sizeof(name3), "model.layers.%d.mlp.down_proj.weight", L);
 
@@ -361,11 +372,7 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
         compiled + cached, compiled, cached);
 
-    if (!compile_lm_head_ane(sf, blob_dir)) {
-        LOG("ANE LM head disabled, falling back to CPU\n");
-    } else {
-        LOG("  LM head ANE enabled (%d chunks)\n", (int)lm_head_kernels_.size());
-    }
+    // LM head: always CPU (lm_head_ is float32, use matvec directly)
 
     return true;
 }
@@ -424,15 +431,21 @@ bool Qwen3Model::forward_full_attn_core(int L, float* x, float* pre_oproj, int p
     auto& cache = kv_caches_[L];
 
     float* qkv_buf = scratch_qkv_;
-    if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x,
-                    hidden_size_, q_proj_dim_ + 2 * kv_proj_dim_)) {
-        fprintf(stderr, "ANE first_proj eval failed at layer %d\n", L);
-        return false;
-    }
-
     float* q_raw = qkv_buf;
     float* k_raw = qkv_buf + q_proj_dim_;
     float* v_raw = qkv_buf + q_proj_dim_ + kv_proj_dim_;
+
+    if (use_ane_first_proj_) {
+        if (!ane_matvec(ane_layers_[L].first_proj, qkv_buf, x,
+                        hidden_size_, q_proj_dim_ + 2 * kv_proj_dim_)) {
+            fprintf(stderr, "ANE first_proj eval failed at layer %d\n", L);
+            return false;
+        }
+    } else {
+        matvec_bf16(q_raw, lw.q_proj_w, x, q_proj_dim_, hidden_size_);
+        matvec_bf16(k_raw, lw.k_proj_w, x, kv_proj_dim_, hidden_size_);
+        matvec_bf16(v_raw, lw.v_proj_w, x, kv_proj_dim_, hidden_size_);
+    }
 
     for (int h = 0; h < num_q_heads_; h++) {
         float* qh = q_raw + (size_t)h * head_dim_;
@@ -489,10 +502,7 @@ float* Qwen3Model::forward(int token_id, int pos) {
         }
 
         float* attn_out = x_norm_;
-        if (!ane_matvec(ane_layers_[L].o_proj, attn_out, pre_oproj, full_out_dim_, hidden_size_)) {
-            fprintf(stderr, "ANE o_proj eval failed at layer %d\n", L);
-            return nullptr;
-        }
+        matvec_bf16(attn_out, layers_[L].o_proj_w, pre_oproj, hidden_size_, full_out_dim_);
 
         for (int i = 0; i < hidden_size_; i++) {
             x_[i] += attn_out[i];

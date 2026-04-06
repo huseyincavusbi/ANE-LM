@@ -2,7 +2,9 @@
 
 #include "qwen3_5.h"
 #include "../../core/ane_runtime.h"
+#include "../../core/model_loader.h"
 #include <nlohmann/json.hpp>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -61,6 +63,11 @@ private:
         float* post_attention_layernorm = nullptr;
         float* q_norm = nullptr;
         float* k_norm = nullptr;
+        // BF16 projection weights for CPU fallback (point into mmap'd safetensors)
+        const uint16_t* q_proj_w = nullptr;
+        const uint16_t* k_proj_w = nullptr;
+        const uint16_t* v_proj_w = nullptr;
+        const uint16_t* o_proj_w = nullptr;
     };
 
     struct KVCache {
@@ -78,6 +85,11 @@ private:
     float* embed_tokens_ = nullptr;
     float* lm_head_ = nullptr;
     float* final_norm_ = nullptr;
+
+    // Keep safetensors mmap alive so BF16 CPU weight pointers remain valid
+    std::unique_ptr<ModelWeights> weights_;
+    // True when num_layers * 2 <= ANE_LOAD_LIMIT so first_proj can run on ANE
+    bool use_ane_first_proj_ = false;
 
     std::vector<ANEKernel*> lm_head_kernels_;
     int lm_head_chunk_ = LM_HEAD_ANE_CHUNK_MAX;
