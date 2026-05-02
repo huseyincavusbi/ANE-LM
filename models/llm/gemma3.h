@@ -54,6 +54,7 @@ private:
     float rms_eps_ = 1e-6f;
     bool tie_word_embeddings_ = true;
     bool ffn_is_fused_ = true;    // false when gelu fused compile fails
+    std::string weight_prefix_ = "model";
 
     int q_proj_dim_ = 0;
     int kv_proj_dim_ = 0;

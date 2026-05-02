@@ -161,67 +161,77 @@ void Gemma3Model::build_rope_table(float* cos_out, float* sin_out, int len, floa
 bool Gemma3Model::load_weights(ModelWeights* sf) {
     char name[256];
 
-    embed_tokens_ = sf->load_bf16_to_f32("model.embed_tokens.weight",
-                                          (int64_t)vocab_size_ * hidden_size_);
+    // Handle potential weight prefixes (multimodal variants often use "language_model.model.")
+    weight_prefix_ = "model";
+    if (!sf->find("model.embed_tokens.weight")) {
+        if (sf->find("language_model.model.embed_tokens.weight")) {
+            weight_prefix_ = "language_model.model";
+        }
+    }
+    const char* p = weight_prefix_.c_str();
+
+    snprintf(name, sizeof(name), "%s.embed_tokens.weight", p);
+    embed_tokens_ = sf->load_bf16_to_f32(name, (int64_t)vocab_size_ * hidden_size_);
     if (!embed_tokens_) return false;
 
     if (tie_word_embeddings_) {
         lm_head_ = embed_tokens_;
     } else {
-        lm_head_ = sf->load_bf16_to_f32("lm_head.weight",
-                                          (int64_t)vocab_size_ * hidden_size_);
+        snprintf(name, sizeof(name), "%slm_head.weight", strcmp(p, "model") == 0 ? "" : "language_model.");
+        lm_head_ = sf->load_bf16_to_f32(name, (int64_t)vocab_size_ * hidden_size_);
         if (!lm_head_) return false;
     }
 
-    final_norm_ = sf->load_bf16_to_f32("model.norm.weight", hidden_size_);
+    snprintf(name, sizeof(name), "%s.norm.weight", p);
+    final_norm_ = sf->load_bf16_to_f32(name, hidden_size_);
     if (!final_norm_) return false;
 
     for (int L = 0; L < num_layers_; L++) {
         auto& lw = layers_[L];
 
-        snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.input_layernorm.weight", p, L);
         lw.input_layernorm = sf->load_bf16_to_f32(name, hidden_size_);
         if (!lw.input_layernorm) return false;
 
-        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.post_attention_layernorm.weight", p, L);
         lw.post_attention_layernorm = sf->load_bf16_to_f32(name, hidden_size_);
         if (!lw.post_attention_layernorm) return false;
 
-        snprintf(name, sizeof(name), "model.layers.%d.pre_feedforward_layernorm.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.pre_feedforward_layernorm.weight", p, L);
         lw.pre_feedforward_layernorm = sf->load_bf16_to_f32(name, hidden_size_);
         if (!lw.pre_feedforward_layernorm) return false;
 
-        snprintf(name, sizeof(name), "model.layers.%d.post_feedforward_layernorm.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.post_feedforward_layernorm.weight", p, L);
         lw.post_feedforward_layernorm = sf->load_bf16_to_f32(name, hidden_size_);
         if (!lw.post_feedforward_layernorm) return false;
 
         // Per-head Q/K norms (head_dim-sized, shared across all heads)
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.self_attn.q_norm.weight", p, L);
         lw.q_norm = sf->load_bf16_to_f32(name, head_dim_);
         if (!lw.q_norm) return false;
 
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.self_attn.k_norm.weight", p, L);
         lw.k_norm = sf->load_bf16_to_f32(name, head_dim_);
         if (!lw.k_norm) return false;
 
         // BF16 pointers for CPU fallback (backed by mmap kept alive in weights_)
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.self_attn.q_proj.weight", p, L);
         lw.q_proj_w = sf->get_bf16_ptr(name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.self_attn.k_proj.weight", p, L);
         lw.k_proj_w = sf->get_bf16_ptr(name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.self_attn.v_proj.weight", p, L);
         lw.v_proj_w = sf->get_bf16_ptr(name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.self_attn.o_proj.weight", p, L);
         lw.o_proj_w = sf->get_bf16_ptr(name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.mlp.gate_proj.weight", p, L);
         lw.gate_proj_w = sf->get_bf16_ptr(name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.mlp.up_proj.weight", p, L);
         lw.up_proj_w = sf->get_bf16_ptr(name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", L);
+        snprintf(name, sizeof(name), "%s.layers.%d.mlp.down_proj.weight", p, L);
         lw.down_proj_w = sf->get_bf16_ptr(name);
     }
 
-    LOG("All Gemma3 weights loaded successfully\n");
+    LOG("All Gemma3/MedGemma weights loaded successfully\n");
     return true;
 }
 
@@ -248,7 +258,9 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     use_ane_first_proj_ = (num_layers_ * 2 <= ANE_LOAD_LIMIT);
 
     bool use_blobs = !blob_dir.empty();
-    LOG("Compiling Gemma3 ANE kernels%s (first_proj=%s, o_proj=CPU, lm_head=CPU)...\n",
+    const char* p = weight_prefix_.c_str();
+
+    LOG("Compiling Gemma3/MedGemma ANE kernels%s (first_proj=%s, o_proj=CPU, lm_head=CPU)...\n",
         use_blobs ? " (from blobs)" : "",
         use_ane_first_proj_ ? "ANE" : "CPU");
 
@@ -256,9 +268,11 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     // If it fails, fall back to CPU for FFN entirely (to stay within ANE budget).
     ffn_is_fused_ = true;
     {
-        const char* g0 = "model.layers.0.mlp.gate_proj.weight";
-        const char* u0 = "model.layers.0.mlp.up_proj.weight";
-        const char* d0 = "model.layers.0.mlp.down_proj.weight";
+        char g0[256], u0[256], d0[256];
+        snprintf(g0, sizeof(g0), "%s.layers.0.mlp.gate_proj.weight", p);
+        snprintf(u0, sizeof(u0), "%s.layers.0.mlp.up_proj.weight",   p);
+        snprintf(d0, sizeof(d0), "%s.layers.0.mlp.down_proj.weight", p);
+
         ANEKernel* test = use_blobs
             ? ane_compile_fused_ffn_gelu_blob(
                 blob_path(blob_dir, g0), blob_path(blob_dir, u0),
@@ -286,9 +300,9 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
 
         if (use_ane_first_proj_) {
             // QKV projection (fused)
-            snprintf(name,  sizeof(name),  "model.layers.%d.self_attn.q_proj.weight", L);
-            snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
-            snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
+            snprintf(name,  sizeof(name),  "%s.layers.%d.self_attn.q_proj.weight", p, L);
+            snprintf(name2, sizeof(name2), "%s.layers.%d.self_attn.k_proj.weight", p, L);
+            snprintf(name3, sizeof(name3), "%s.layers.%d.self_attn.v_proj.weight", p, L);
 
             if (use_blobs) {
                 ane_layers_[L].first_proj = ane_compile_fused_3_blob(
@@ -311,9 +325,9 @@ bool Gemma3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         // o_proj is always on CPU — do not compile
 
         if (ffn_is_fused_) {
-            snprintf(name,  sizeof(name),  "model.layers.%d.mlp.gate_proj.weight", L);
-            snprintf(name2, sizeof(name2), "model.layers.%d.mlp.up_proj.weight",   L);
-            snprintf(name3, sizeof(name3), "model.layers.%d.mlp.down_proj.weight", L);
+            snprintf(name,  sizeof(name),  "%s.layers.%d.mlp.gate_proj.weight", p, L);
+            snprintf(name2, sizeof(name2), "%s.layers.%d.mlp.up_proj.weight",   p, L);
+            snprintf(name3, sizeof(name3), "%s.layers.%d.mlp.down_proj.weight", p, L);
 
             if (use_blobs) {
                 ane_layers_[L].fused_ffn = ane_compile_fused_ffn_gelu_blob(
@@ -365,15 +379,27 @@ bool Gemma3Model::load(const std::string& model_dir) {
         return false;
     }
 
+    // Handle potential weight prefixes (multimodal variants often use "language_model.model.")
+    weight_prefix_ = "model";
+    if (!sf->find("model.embed_tokens.weight")) {
+        if (sf->find("language_model.model.embed_tokens.weight")) {
+            weight_prefix_ = "language_model.model";
+        }
+    }
+    const char* p = weight_prefix_.c_str();
+
     // Infer dims from safetensors
-    const SFTensor* embed = sf->find("model.embed_tokens.weight");
+    char name_buf[256];
+    snprintf(name_buf, sizeof(name_buf), "%s.embed_tokens.weight", p);
+    const SFTensor* embed = sf->find(name_buf);
     if (!embed || embed->ndims != 2) {
-        fprintf(stderr, "Missing/invalid model.embed_tokens.weight\n");
+        fprintf(stderr, "Missing/invalid %s\n", name_buf);
         return false;
     }
-    const SFTensor* gate = sf->find("model.layers.0.mlp.gate_proj.weight");
+    snprintf(name_buf, sizeof(name_buf), "%s.layers.0.mlp.gate_proj.weight", p);
+    const SFTensor* gate = sf->find(name_buf);
     if (!gate || gate->ndims != 2) {
-        fprintf(stderr, "Missing/invalid gate_proj.weight\n");
+        fprintf(stderr, "Missing/invalid %s\n", name_buf);
         return false;
     }
 
@@ -386,7 +412,7 @@ bool Gemma3Model::load(const std::string& model_dir) {
     kv_proj_dim_ = num_kv_heads_ * head_dim_;
     embed_scale_ = sqrtf((float)hidden_size_);
 
-    LOG("Gemma3 dims: hidden=%d inter=%d vocab=%d layers=%d heads=%d/%d\n",
+    LOG("Gemma3/MedGemma dims: hidden=%d inter=%d vocab=%d layers=%d heads=%d/%d\n",
         hidden_size_, intermediate_size_, vocab_size_, num_layers_,
         num_q_heads_, num_kv_heads_);
 
