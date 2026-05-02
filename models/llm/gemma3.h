@@ -70,10 +70,9 @@ private:
         float* post_attention_layernorm = nullptr;
         float* pre_feedforward_layernorm = nullptr;
         float* post_feedforward_layernorm = nullptr;
-        // Per-head Q/K norms (Gemma3 specific, shape=[head_dim])
+        // ... (other pointers)
         float* q_norm = nullptr;
         float* k_norm = nullptr;
-        // BF16 projection weights for CPU fallback (point into mmap'd safetensors)
         const uint16_t* q_proj_w = nullptr;
         const uint16_t* k_proj_w = nullptr;
         const uint16_t* v_proj_w = nullptr;
@@ -81,11 +80,19 @@ private:
         const uint16_t* gate_proj_w = nullptr;
         const uint16_t* up_proj_w = nullptr;
         const uint16_t* down_proj_w = nullptr;
+
+        // Metal buffers
+        void* m_input_norm_w = nullptr;
+        void* m_post_attn_norm_w = nullptr;
+        void* m_pre_ffn_norm_w = nullptr;
+        void* m_post_ffn_norm_w = nullptr;
     };
 
     struct KVCache {
         float* k_cache = nullptr;
         float* v_cache = nullptr;
+        void* m_k_cache = nullptr; 
+        void* m_v_cache = nullptr;
         int len = 0;
         int start = 0;
         int capacity = 0;
