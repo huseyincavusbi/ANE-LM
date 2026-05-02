@@ -30,7 +30,8 @@ std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
         model = std::make_unique<Qwen35Model>();
     } else if (model_type == "qwen3") {
         model = std::make_unique<Qwen3Model>();
-    } else if (model_type == "gemma3" || model_type == "gemma3_text") {
+    } else if (model_type == "gemma3" || model_type == "gemma3_text" || 
+               model_type == "medgemma" || model_type == "med_gemma") {
         model = std::make_unique<Gemma3Model>();
     } else {
         throw std::runtime_error("Unsupported model_type: " + model_type);
