@@ -47,6 +47,7 @@ set(CORE_SOURCES
     core/model_loader.cpp
     core/tokenizer.cpp
     core/cpu_ops.cpp
+    core/metal_ops.mm
     core/sampling.cpp
     core/ane_runtime.cpp
     utils.cpp
@@ -78,6 +79,8 @@ set(COMMON_LINK_LIBS
     "-framework Foundation"
     "-framework IOSurface"
     "-framework Accelerate"
+    "-framework Metal"
+    "-framework QuartzCore"
     "-lobjc"
 )
 
