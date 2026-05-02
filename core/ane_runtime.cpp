@@ -707,6 +707,16 @@ void ane_free_layer(LayerANEKernels* lk) {
     lk->first_proj = lk->o_proj = lk->fused_ffn = nullptr;
 }
 
+IOSurfaceRef ane_get_input_surface(ANEKernel* k, int index) {
+    if (!k || index >= k->nInputs) return nullptr;
+    return k->ioInputs[index];
+}
+
+IOSurfaceRef ane_get_output_surface(ANEKernel* k, int index) {
+    if (!k || index >= k->nOutputs) return nullptr;
+    return k->ioOutputs[index];
+}
+
 // ============ High-level compile functions ============
 
 ANEKernel* ane_compile_matmul(const uint16_t* bf16_weights, int out_dim, int in_dim) {

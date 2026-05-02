@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <IOSurface/IOSurfaceRef.h>
 
 namespace ane_lm {
 
@@ -61,5 +62,9 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
 // Kernel cleanup
 void ane_free(ANEKernel* k);
 void ane_free_layer(LayerANEKernels* lk);
+
+// Surface accessors (for Zero-copy GPU bridging)
+IOSurfaceRef ane_get_input_surface(ANEKernel* k, int index);
+IOSurfaceRef ane_get_output_surface(ANEKernel* k, int index);
 
 } // namespace ane_lm
