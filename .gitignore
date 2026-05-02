@@ -3,3 +3,8 @@ example/
 .DS_Store
 *.dSYM/
 .idea
+.entire/
+.gemini/
+models/hf/
+ane_weights/
+*.bin
