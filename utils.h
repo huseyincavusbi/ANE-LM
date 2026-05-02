@@ -11,6 +11,6 @@
 namespace ane_lm {
 
 std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
-    const std::string& model_dir, bool ane_cache = true);
+    const std::string& model_dir, bool ane_cache = true, bool use_gpu = true);
 
 } // namespace ane_lm

@@ -13,6 +13,7 @@ namespace ane_lm {
 
 // Global verbose flag (default: off)
 extern bool g_verbose;
+extern bool g_use_gpu; // New flag for Metal backend control
 
 // Verbose logging macro — prints only when g_verbose is true
 #define LOG(...) do { if (ane_lm::g_verbose) fprintf(stderr, __VA_ARGS__); } while (0)

@@ -10,9 +10,10 @@ namespace ane_lm {
 using json = nlohmann::json;
 
 std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
-    const std::string& model_dir, bool ane_cache)
+    const std::string& model_dir, bool ane_cache, bool use_gpu)
 {
     Timer timer;
+    g_use_gpu = use_gpu;
 
     // Read model_type from config.json
     std::string config_path = model_dir + "/config.json";

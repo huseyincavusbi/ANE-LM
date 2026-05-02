@@ -37,6 +37,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --repeat-penalty P Repetition penalty (default: 1.2, 1.0=off)\n");
     fprintf(stderr, "  --enable-thinking Enable thinking/reasoning mode\n");
     fprintf(stderr, "  --no-ane-cache    Disable persistent ANE compile cache\n");
+    fprintf(stderr, "  --no-gpu          Disable Metal GPU backend (force CPU for sequential ops)\n");
     fprintf(stderr, "  --port N          Server port (serve only, default: 8080)\n");
     fprintf(stderr, "  -v, --verbose     Show detailed initialization info\n");
     fprintf(stderr, "\nExamples:\n");
@@ -51,6 +52,7 @@ struct Args {
     int max_tokens = 0;
     float repetition_penalty = 1.2f;
     bool ane_cache = true;
+    bool use_gpu = true;
     bool enable_thinking = false;
     int port = 8080;
 };
@@ -72,6 +74,8 @@ static Args parse_args(int argc, char* argv[], int start) {
             args.enable_thinking = true;
         } else if (strcmp(argv[i], "--no-ane-cache") == 0) {
             args.ane_cache = false;
+        } else if (strcmp(argv[i], "--no-gpu") == 0) {
+            args.use_gpu = false;
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             args.port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
@@ -258,7 +262,7 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<LLMModel> model;
     Tokenizer tokenizer;
     try {
-        auto result = load(args.model_dir, args.ane_cache);
+        auto result = load(args.model_dir, args.ane_cache, args.use_gpu);
         model = std::move(result.first);
         tokenizer = std::move(result.second);
     } catch (const std::exception& e) {
